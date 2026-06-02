@@ -254,6 +254,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_CODEBUDDY_ACP_BASE_URL,
         base_url_env_var="CODEBUDDY_ACP_BASE_URL",
     ),
+    "codebuddy-http": ProviderConfig(
+        id="codebuddy-http",
+        name="CodeBuddy HTTP Server",
+        auth_type="external_process",
+        inference_base_url="http://codebuddy-http",
+        base_url_env_var="HERMES_CODEBUDDY_HTTP_BASE_URL",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",

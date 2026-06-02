@@ -357,8 +357,10 @@ def init_agent(
         and agent.api_mode == "chat_completions"
         and agent.provider != "copilot-acp"
         and agent.provider != "codebuddy-acp"
+        and agent.provider != "codebuddy-http"
         and not str(agent.base_url or "").lower().startswith("acp://copilot")
         and not str(agent.base_url or "").lower().startswith("acp://codebuddy")
+        and not str(agent.base_url or "").lower().startswith("http://codebuddy-http")
         and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
         and (

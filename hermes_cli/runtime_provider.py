@@ -1474,6 +1474,21 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    if provider == "codebuddy-http":
+        # CodeBuddy HTTP API provider — routes to CodeBuddyHTTPClient in agent_runtime_helpers.
+        # Uses a sentinel base_url so agent_runtime_helpers can identify it.
+        # No real auth needed; the HTTP server runs locally.
+        import os as _os
+        _http_base = _os.getenv("HERMES_CODEBUDDY_HTTP_BASE_URL", "").strip().rstrip("/") or "http://127.0.0.1:18080"
+        return {
+            "provider": "codebuddy-http",
+            "api_mode": "chat_completions",
+            "base_url": "http://codebuddy-http",
+            "api_key": "codebuddy-http",
+            "source": "config",
+            "requested_provider": requested_provider,
+        }
+
     # Anthropic (native Messages API)
     if provider == "anthropic":
         # Allow base URL override from config.yaml model.base_url, but only
