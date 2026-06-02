@@ -436,9 +436,14 @@ class CodeBuddyACPClient:
         self, prompt_text: str, *, model: str | None = None, timeout_seconds: float
     ) -> tuple[str, str]:
         """Spawn codebuddy --acp, perform full ACP handshake, return (text, reasoning)."""
+        # Build dynamic args: base args + optional --model override
+        effective_model = model or os.getenv("HERMES_CODEBUDDY_ACP_MODEL", "").strip()
+        dynamic_args = list(self._acp_args)
+        if effective_model and "--model" not in dynamic_args:
+            dynamic_args += ["--model", effective_model]
         try:
             proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
+                [self._acp_command] + dynamic_args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
