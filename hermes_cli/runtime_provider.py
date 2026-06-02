@@ -1489,6 +1489,20 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    if provider == "copilot-tencent":
+        # Direct Copilot Tencent API provider — routes to CopilotTencentClient in agent_runtime_helpers.
+        # Auth is handled internally by CopilotTencentClient (reads CodeBuddy credentials from local file).
+        import os as _os
+        _base = _os.getenv("HERMES_COPILOT_TENCENT_BASE_URL", "").strip().rstrip("/") or "https://copilot.tencent.com/v2"
+        return {
+            "provider": "copilot-tencent",
+            "api_mode": "chat_completions",
+            "base_url": _base,
+            "api_key": "copilot-tencent",
+            "source": "config",
+            "requested_provider": requested_provider,
+        }
+
     # Anthropic (native Messages API)
     if provider == "anthropic":
         # Allow base URL override from config.yaml model.base_url, but only

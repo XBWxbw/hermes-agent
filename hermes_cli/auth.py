@@ -261,6 +261,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="http://codebuddy-http",
         base_url_env_var="HERMES_CODEBUDDY_HTTP_BASE_URL",
     ),
+    "copilot-tencent": ProviderConfig(
+        id="copilot-tencent",
+        name="Copilot Tencent (Direct)",
+        auth_type="external_process",
+        inference_base_url="https://copilot.tencent.com/v2",
+        base_url_env_var="HERMES_COPILOT_TENCENT_BASE_URL",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",

@@ -1277,6 +1277,17 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
+    if agent.provider == "copilot-tencent" or str(client_kwargs.get("base_url", "")).startswith("https://copilot.tencent.com"):
+        from agent.copilot_tencent_client import CopilotTencentClient
+
+        client = CopilotTencentClient(**client_kwargs)
+        _ra().logger.info(
+            "Copilot Tencent client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     if agent.provider == "google-gemini-cli" or str(client_kwargs.get("base_url", "")).startswith("cloudcode-pa://"):
         from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
 
