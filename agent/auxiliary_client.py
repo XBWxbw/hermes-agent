@@ -155,6 +155,9 @@ _PROVIDER_ALIASES = {
     "github-models": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "codebuddy": "codebuddy-acp",
+    "codebuddy-acp-agent": "codebuddy-acp",
+    "tencentcodebuddy": "codebuddy-acp",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
@@ -3681,6 +3684,34 @@ def resolve_provider_client(
             from agent.copilot_acp_client import CopilotACPClient
 
             client = CopilotACPClient(
+                api_key=api_key,
+                base_url=base_url,
+                command=command,
+                args=args,
+            )
+            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
+        if provider == "codebuddy-acp":
+            api_key = str(creds.get("api_key", "")).strip()
+            base_url = str(creds.get("base_url", "")).strip()
+            command = str(creds.get("command", "")).strip() or None
+            args = list(creds.get("args") or [])
+            if not final_model:
+                logger.warning(
+                    "resolve_provider_client: codebuddy-acp requested but no model "
+                    "was provided or configured"
+                )
+                return None, None
+            if not api_key or not base_url:
+                logger.warning(
+                    "resolve_provider_client: codebuddy-acp requested but external "
+                    "process credentials are incomplete"
+                )
+                return None, None
+            from agent.codebuddy_acp_client import CodeBuddyACPClient
+
+            client = CodeBuddyACPClient(
                 api_key=api_key,
                 base_url=base_url,
                 command=command,

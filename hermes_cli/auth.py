@@ -107,6 +107,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_CODEBUDDY_ACP_BASE_URL = "acp://codebuddy"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -245,6 +246,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "codebuddy-acp": ProviderConfig(
+        id="codebuddy-acp",
+        name="CodeBuddy ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CODEBUDDY_ACP_BASE_URL,
+        base_url_env_var="CODEBUDDY_ACP_BASE_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -1439,6 +1447,7 @@ def resolve_provider(
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
+        "codebuddy": "codebuddy-acp", "codebuddy-acp-agent": "codebuddy-acp", "tencentcodebuddy": "codebuddy-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth", "google-gemini-cli": "google-gemini-cli", "gemini-cli": "google-gemini-cli", "gemini-oauth": "google-gemini-cli",
@@ -5924,6 +5933,32 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
+    # ── codebuddy-acp: use dedicated env vars ──────────────────────────
+    if provider_id == "codebuddy-acp":
+        command = (
+            os.getenv("HERMES_CODEBUDDY_ACP_COMMAND", "").strip()
+            or "codebuddy"
+        )
+        raw_args = os.getenv("HERMES_CODEBUDDY_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp"]
+        resolved_command = shutil.which(command) if command else None
+        if not resolved_command and not base_url.startswith("acp+tcp://"):
+            raise AuthError(
+                f"Could not find the CodeBuddy CLI command '{command}'. "
+                "Install CodeBuddy CLI or set HERMES_CODEBUDDY_ACP_COMMAND.",
+                provider=provider_id,
+                code="missing_codebuddy_cli",
+            )
+        return {
+            "provider": provider_id,
+            "api_key": "codebuddy-acp",
+            "base_url": base_url.rstrip("/"),
+            "command": resolved_command or command,
+            "args": args,
+            "source": "process",
+        }
+
+    # ── copilot-acp (default external_process path) ────────────────────
     command = (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
