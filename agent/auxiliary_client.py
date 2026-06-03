@@ -3729,6 +3729,15 @@ def resolve_provider_client(
             logger.debug("resolve_provider_client: copilot-tencent (%s)", final_model)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
+        if provider == "gongfeng":
+            # Direct Gongfeng Copilot Gateway — auth via GF_TOKEN/GF_DEVICE_ID/GF_USERNAME env vars
+            if not final_model:
+                final_model = "hy3-preview-ioa"
+            from agent.gongfeng_client import GongfengClient
+            client = GongfengClient(api_key="gongfeng")
+            logger.debug("resolve_provider_client: gongfeng (%s)", final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
         logger.warning("resolve_provider_client: external-process provider %s not "
                        "directly supported", provider)
         return None, None

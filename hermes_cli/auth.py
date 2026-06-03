@@ -268,6 +268,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="https://copilot.tencent.com/v2",
         base_url_env_var="HERMES_COPILOT_TENCENT_BASE_URL",
     ),
+    "gongfeng": ProviderConfig(
+        id="gongfeng",
+        name="Gongfeng Copilot Gateway",
+        auth_type="external_process",
+        inference_base_url="https://copilot.code.woa.com/server/openclaw/copilot-gateway/v1",
+        base_url_env_var="HERMES_GONGFENG_BASE_URL",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
@@ -5952,6 +5959,15 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         return {
             "provider": provider_id,
             "api_key": "copilot-tencent",
+            "base_url": base_url.rstrip("/"),
+            "source": "direct",
+        }
+
+    # ── gongfeng: direct Gongfeng Copilot Gateway, no subprocess needed ──
+    if provider_id == "gongfeng":
+        return {
+            "provider": provider_id,
+            "api_key": "gongfeng",
             "base_url": base_url.rstrip("/"),
             "source": "direct",
         }

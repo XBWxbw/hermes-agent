@@ -1,33 +1,28 @@
-"""OpenAI-compatible client that directly calls copilot.tencent.com/v2.
+"""OpenAI-compatible client that directly calls the Gongfeng Copilot Gateway.
 
-This provider bypasses `codebuddy --serve` and calls the underlying model
-endpoint directly, using the same SSO accessToken that codebuddy stores locally.
+Calls https://copilot.code.woa.com/server/openclaw/copilot-gateway/v1/chat/completions
+using standard OAUTH-TOKEN / DEVICE-ID / X-Username headers.
 
-Key advantages over codebuddy-http:
-  - No intermediate codebuddy process required
+Key advantages:
+  - No intermediate adapter process required
   - Hermes agent loop runs natively (real function calling, not text parsing)
-  - Standard OpenAI streaming SSE format
-  - Supports all models: glm-5.1-ioa, deepseek-v3-2-volc-ioa, claude-*, etc.
+  - Supports all Gongfeng models: claude-sonnet-4.6, hy3-preview-ioa, glm-5.1-ioa, etc.
 
-Auth:
-  Token is read from CodeBuddy's local credential store:
-    %LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info
-  Required headers:
-    Authorization: Bearer <accessToken>
-    X-Domain: tencent.sso.copilot.tencent.com
-    X-Enterprise-Id: <enterpriseId>
-    X-Tenant-Id: <enterpriseId>
+Auth headers (read from env vars or passed directly):
+  OAUTH-TOKEN: <GF_TOKEN>
+  DEVICE-ID:   <GF_DEVICE_ID>
+  X-Username:  <GF_USERNAME>
 
-Endpoint: https://copilot.tencent.com/v2/chat/completions
-  - Only streaming mode is supported (stream: true required)
-  - Standard OpenAI SSE format
+Gongfeng Gateway also requires:
+  X-Model-Name: human-readable model name e.g. "Claude Sonnet 4.6"
+
+Endpoint: https://copilot.code.woa.com/server/openclaw/copilot-gateway/v1/chat/completions
 """
 
 from __future__ import annotations
 
 import json
 import os
-import pathlib
 import ssl
 import time
 from types import SimpleNamespace
@@ -35,67 +30,125 @@ from typing import Any, Iterator
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-_COPILOT_BASE_URL = "https://copilot.tencent.com/v2"
-_IOA_DOMAIN = "tencent.sso.copilot.tencent.com"
+_GONGFENG_BASE_URL = "https://copilot.code.woa.com/server/openclaw/copilot-gateway/v1"
 _DEFAULT_TIMEOUT_SECONDS = 300.0
 
 # Marker used in config.yaml base_url to identify this provider
-COPILOT_TENCENT_MARKER_BASE_URL = "https://copilot.tencent.com"
+GONGFENG_MARKER_BASE_URL = "https://copilot.code.woa.com"
+
+# Map model id -> human-readable X-Model-Name (required by Gongfeng Gateway)
+_GATEWAY_MODEL_NAMES: dict[str, str] = {
+    # Claude
+    "claude-opus-4.6": "Claude Opus 4.6",
+    "claude-opus-4.7": "Claude Opus 4.7",
+    "claude-4.5": "Claude Sonnet 4.5",
+    "claude-sonnet-4.6": "Claude Sonnet 4.6",
+    "claude-sonnet-4-5": "Claude Sonnet 4.5",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "claude-opus-4-6": "Claude Opus 4.6",
+    # Gemini
+    "gemini-3.1-pro": "Gemini 3.1 Pro",
+    # GPT
+    "gpt-5.4": "GPT 5.4",
+    "gpt-5.3-codex": "GPT 5.3 Codex",
+    # 国内模型
+    "glm-5.1-ioa": "GLM 5.1",
+    "deepseek-v4-flash-ioa": "DeepSeek V4 Flash",
+    "hy3-preview-ioa": "Hy3 Preview",
+    "hy-3-dev": "Hy3 Preview",
+    "deepseek-v3-2-volc-ioa": "DeepSeek V3",
+    "deepseek-v3-2": "DeepSeek V3",
+    "kimi-k2.6-ioa": "Kimi K2",
+    "kimi-k2.5-ioa": "Kimi K2",
+    "minimax-m2.7-ioa": "MiniMax M2",
+    "minimax-m2.5-ioa": "MiniMax M2",
+}
 
 
 # ---------------------------------------------------------------------------
-# Credential loading
+# Credential helpers
 # ---------------------------------------------------------------------------
 
-def _get_cred_path() -> pathlib.Path:
-    local_app_data = os.environ.get("LOCALAPPDATA", "")
-    if local_app_data:
-        p = pathlib.Path(local_app_data) / "CodeBuddyExtension" / "Data" / "Public" / "auth" / "Tencent-Cloud.coding-copilot.info"
-        if p.exists():
-            return p
-    # Fallback: search common locations
-    candidates = [
-        pathlib.Path.home() / ".codebuddy" / "auth" / "Tencent-Cloud.coding-copilot.info",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    raise FileNotFoundError(
-        "Cannot find CodeBuddy credentials file. "
-        "Expected at: %LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info"
-    )
+def _load_credentials() -> tuple[str, str, str]:
+    """Return (oauth_token, device_id, username) from environment variables.
+
+    Primary source: environment variables GF_TOKEN / GF_DEVICE_ID / GF_USERNAME.
+    These should be set in ~/.hermes/.env or as system env vars.
+    """
+    token = (
+        os.environ.get("GF_TOKEN")
+        or os.environ.get("GONGFENG_OAUTH_TOKEN")
+        or ""
+    ).strip()
+    device_id = (
+        os.environ.get("GF_DEVICE_ID")
+        or os.environ.get("GONGFENG_DEVICE_ID")
+        or ""
+    ).strip()
+    username = (
+        os.environ.get("GF_USERNAME")
+        or os.environ.get("GONGFENG_USERNAME")
+        or ""
+    ).strip()
+
+    if not token:
+        raise RuntimeError(
+            "Gongfeng credentials missing. Set GF_TOKEN (or GONGFENG_OAUTH_TOKEN) "
+            "in ~/.hermes/.env or as system environment variable."
+        )
+    if not device_id:
+        raise RuntimeError(
+            "Gongfeng credentials missing. Set GF_DEVICE_ID (or GONGFENG_DEVICE_ID) "
+            "in ~/.hermes/.env or as system environment variable."
+        )
+    if not username:
+        raise RuntimeError(
+            "Gongfeng credentials missing. Set GF_USERNAME (or GONGFENG_USERNAME) "
+            "in ~/.hermes/.env or as system environment variable."
+        )
+    return token, device_id, username
 
 
-def _load_credentials() -> tuple[str, str]:
-    """Load (accessToken, enterpriseId) from CodeBuddy credential store."""
-    cred_path = _get_cred_path()
-    with open(cred_path, encoding="utf-8") as f:
-        data = json.load(f)
-    auth = data.get("auth") or {}
-    account = data.get("account") or {}
-    access_token = str(auth.get("accessToken") or "").strip()
-    enterprise_id = str(account.get("enterpriseId") or "").strip()
-    if not access_token:
-        raise RuntimeError("CodeBuddy credential file missing accessToken")
-    if not enterprise_id:
-        raise RuntimeError("CodeBuddy credential file missing enterpriseId")
-    return access_token, enterprise_id
+def _resolve_model_id(model: str) -> str:
+    """Strip gongfeng/ prefix and normalize aliases."""
+    if model.startswith("gongfeng/"):
+        model = model[9:]
+    if model.startswith("codebuddy/"):
+        model = model[10:]
+    # Common dash-dot alias normalization
+    aliases = {
+        "claude-sonnet-4-5": "claude-4.5",
+        "claude-sonnet-4-6": "claude-sonnet-4.6",
+        "claude-opus-4-6": "claude-opus-4.6",
+        "gpt-5-3-codex": "gpt-5.3-codex",
+        "gpt-5-4": "gpt-5.4",
+        "deepseek-v3-2": "deepseek-v3-2-volc-ioa",
+        "hy-3-dev": "hy3-preview-ioa",
+    }
+    return aliases.get(model, model)
+
+
+def _make_auth_headers(
+    oauth_token: str,
+    device_id: str,
+    username: str,
+    model_id: str,
+    stream: bool,
+) -> dict[str, str]:
+    x_model_name = _GATEWAY_MODEL_NAMES.get(model_id, model_id)
+    return {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream" if stream else "application/json",
+        "OAUTH-TOKEN": oauth_token,
+        "DEVICE-ID": device_id,
+        "X-Username": username,
+        "X-Model-Name": x_model_name,
+    }
 
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
-
-def _make_auth_headers(access_token: str, enterprise_id: str) -> dict[str, str]:
-    return {
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-        "Authorization": f"Bearer {access_token}",
-        "X-Domain": _IOA_DOMAIN,
-        "X-Enterprise-Id": enterprise_id,
-        "X-Tenant-Id": enterprise_id,
-    }
-
 
 def _http_post_stream(
     url: str,
@@ -103,18 +156,16 @@ def _http_post_stream(
     headers: dict[str, str],
     timeout: float,
 ) -> Iterator[str]:
-    """POST to copilot endpoint and yield SSE lines."""
+    """POST to Gongfeng Gateway and yield raw lines."""
     data = json.dumps(body).encode("utf-8")
     req = Request(url, data=data, headers=headers, method="POST")
     try:
-        # Use unverified SSL context if needed (corporate proxy)
         ctx = ssl.create_default_context()
         with urlopen(req, timeout=timeout, context=ctx) as resp:
             for raw_line in resp:
                 line = raw_line.decode("utf-8").rstrip("\r\n")
                 yield line
     except ssl.SSLError:
-        # Fallback: unverified
         ctx = ssl._create_unverified_context()
         with urlopen(req, timeout=timeout, context=ctx) as resp:
             for raw_line in resp:
@@ -127,18 +178,19 @@ def _http_post_stream(
         except Exception:
             pass
         raise RuntimeError(
-            f"copilot.tencent.com POST {url} failed [{exc.code}]: {body_text}"
+            f"Gongfeng Gateway POST {url} failed [{exc.code}]: {body_text}"
         ) from exc
     except URLError as exc:
         raise RuntimeError(
-            f"copilot.tencent.com POST {url} connection error: {exc.reason}"
+            f"Gongfeng Gateway POST {url} connection error: {exc.reason}"
         ) from exc
 
 
 def _parse_openai_sse_stream(lines: Iterator[str]) -> Iterator[dict[str, Any]]:
     """Parse standard OpenAI SSE stream and yield delta dicts.
 
-    Handles both 'data: {...}' (with space) and 'data:{...}' (without space).
+    Handles both 'data: {...}' (with space) and 'data:{...}' (without space)
+    formats, as Gongfeng Gateway omits the space after 'data:'.
     """
     for line in lines:
         if line.startswith("data: "):
@@ -161,10 +213,19 @@ def _parse_openai_sse_stream(lines: Iterator[str]) -> Iterator[dict[str, Any]]:
 # Streaming adapter — lets Hermes iterate SSE chunks in real-time
 # ---------------------------------------------------------------------------
 
-class _CopilotTencentStreamAdapter:
+class _GongfengStreamAdapter:
     """Wraps a live SSE stream so Hermes can do ``for chunk in stream``.
 
-    Mirrors _GongfengStreamAdapter but for copilot.tencent.com.
+    Hermes's ``_call_chat_completions`` expects:
+        for chunk in stream:
+            chunk.choices[0].delta.content  (text delta or "")
+            chunk.choices[0].delta.tool_calls  (list or None)
+            chunk.choices[0].finish_reason  (None or "stop"/"tool_calls")
+            chunk.usage  (None or usage object on final chunk)
+            chunk.model  (str)
+
+    We yield one SimpleNamespace chunk per SSE event, following the standard
+    OpenAI streaming format so Hermes's existing accumulator logic works.
     """
 
     def __init__(
@@ -180,7 +241,8 @@ class _CopilotTencentStreamAdapter:
         self._headers = headers
         self._timeout = timeout
         self._raw_model = raw_model
-        self.response = None
+        # Stub attributes that Hermes reads before iterating
+        self.response = None  # no httpx Response object
 
     def __iter__(self) -> Iterator[Any]:
         line_iter = _http_post_stream(
@@ -199,6 +261,7 @@ class _CopilotTencentStreamAdapter:
                 )
 
             if not choices:
+                # Usage-only chunk (some providers send this at the end)
                 if usage_ns is not None:
                     yield SimpleNamespace(
                         choices=[],
@@ -211,6 +274,7 @@ class _CopilotTencentStreamAdapter:
                 if not isinstance(choice, dict):
                     continue
                 delta_dict = choice.get("delta") or {}
+                # Build tool_calls delta list
                 tc_list = None
                 raw_tc = delta_dict.get("tool_calls")
                 if isinstance(raw_tc, list) and raw_tc:
@@ -253,21 +317,21 @@ class _CopilotTencentStreamAdapter:
 # OpenAI-client facade
 # ---------------------------------------------------------------------------
 
-class _CopilotChatCompletions:
-    def __init__(self, client: "CopilotTencentClient"):
+class _GongfengChatCompletions:
+    def __init__(self, client: "GongfengClient"):
         self._client = client
 
     def create(self, **kwargs: Any) -> Any:
         return self._client._create_chat_completion(**kwargs)
 
 
-class _CopilotChatNamespace:
-    def __init__(self, client: "CopilotTencentClient"):
-        self.completions = _CopilotChatCompletions(client)
+class _GongfengChatNamespace:
+    def __init__(self, client: "GongfengClient"):
+        self.completions = _GongfengChatCompletions(client)
 
 
-class CopilotTencentClient:
-    """OpenAI-compatible client that directly calls copilot.tencent.com/v2.
+class GongfengClient:
+    """OpenAI-compatible client that directly calls the Gongfeng Copilot Gateway.
 
     Drop-in replacement for OpenAI client. Hermes treats this exactly like
     any other OpenAI-compatible provider — function calling, streaming,
@@ -282,17 +346,17 @@ class CopilotTencentClient:
         default_headers: dict[str, str] | None = None,
         **_: Any,
     ):
-        self.api_key = api_key or "copilot-tencent"
-        self.base_url = _COPILOT_BASE_URL
-        self._base_url = _COPILOT_BASE_URL
+        self.api_key = api_key or "gongfeng"
+        self.base_url = _GONGFENG_BASE_URL
+        self._base_url = _GONGFENG_BASE_URL
         self._default_headers = dict(default_headers or {})
         self._custom_headers: dict[str, str] = {}  # agent_init.py reads this for default_headers
-        self.chat = _CopilotChatNamespace(self)
+        self.chat = _GongfengChatNamespace(self)
         self.is_closed = False
-        # Cache credentials (reload if needed)
-        self._cached_creds: tuple[str, str] | None = None
+        # Cache credentials (reload once per instance)
+        self._cached_creds: tuple[str, str, str] | None = None
 
-    def _get_creds(self) -> tuple[str, str]:
+    def _get_creds(self) -> tuple[str, str, str]:
         if self._cached_creds is None:
             self._cached_creds = _load_credentials()
         return self._cached_creds
@@ -323,14 +387,21 @@ class CopilotTencentClient:
             numeric = [float(v) for v in candidates if isinstance(v, (int, float))]
             effective_timeout = max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        access_token, enterprise_id = self._get_creds()
-        headers = _make_auth_headers(access_token, enterprise_id)
+        raw_model = model or "hy3-preview-ioa"
+        model_id = _resolve_model_id(raw_model)
+
+        oauth_token, device_id, username = self._get_creds()
+        # Gongfeng Gateway supports streaming; use streaming internally and aggregate
+        headers = _make_auth_headers(oauth_token, device_id, username, model_id, stream=True)
 
         # Build request body — standard OpenAI format
+        # Gongfeng Gateway uses the human-readable model name via X-Model-Name header,
+        # but also needs model field in body (use the normalized id or gateway name)
+        gw_model_name = _GATEWAY_MODEL_NAMES.get(model_id, model_id)
         request_body: dict[str, Any] = {
-            "model": model or "glm-5.1-ioa",
+            "model": gw_model_name,
             "messages": messages or [],
-            "stream": True,  # copilot.tencent.com only supports streaming
+            "stream": True,
         }
 
         # Pass extra params
@@ -348,25 +419,30 @@ class CopilotTencentClient:
 
         # --- Streaming path: return adapter so caller can iterate chunks ---
         if stream:
-            return _CopilotTencentStreamAdapter(
+            # Re-build headers with stream=True (already set above, but be explicit)
+            stream_headers = _make_auth_headers(oauth_token, device_id, username, model_id, stream=True)
+            return _GongfengStreamAdapter(
                 url=url,
                 request_body=request_body,
-                headers=headers,
+                headers=stream_headers,
                 timeout=effective_timeout,
-                raw_model=model or "glm-5.1-ioa",
+                raw_model=raw_model,
             )
 
-        # Collect streaming response (non-streaming path aggregates SSE internally)
+        # --- Non-streaming path: switch to non-stream Accept header ---
+        headers = _make_auth_headers(oauth_token, device_id, username, model_id, stream=False)
+        request_body["stream"] = False
+
+        # Collect streaming response
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
-        tool_calls_map: dict[int, dict[str, Any]] = {}  # index -> partial tool call
+        tool_calls_map: dict[int, dict[str, Any]] = {}
         finish_reason = "stop"
         prompt_tokens = 0
         completion_tokens = 0
 
         line_iter = _http_post_stream(url, request_body, headers, effective_timeout)
         for chunk in _parse_openai_sse_stream(line_iter):
-            # Extract usage if present
             usage = chunk.get("usage")
             if isinstance(usage, dict):
                 prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
@@ -386,7 +462,7 @@ class CopilotTencentClient:
                 if isinstance(content, str) and content:
                     text_parts.append(content)
 
-                # Reasoning content (some models)
+                # Reasoning content
                 reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                 if isinstance(reasoning, str) and reasoning:
                     reasoning_parts.append(reasoning)
@@ -446,12 +522,12 @@ class CopilotTencentClient:
             reasoning_content=response_reasoning or None,
             reasoning_details=None,
         )
-        choice = SimpleNamespace(
+        choice_ns = SimpleNamespace(
             message=assistant_message,
             finish_reason=finish_reason,
         )
         return SimpleNamespace(
-            choices=[choice],
+            choices=[choice_ns],
             usage=usage_ns,
-            model=model or "glm-5.1-ioa",
+            model=raw_model,
         )

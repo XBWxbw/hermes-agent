@@ -1,0 +1,5 @@
+name: gongfeng-provider
+kind: model-provider
+version: 1.0.0
+description: Gongfeng Copilot Gateway (copilot.code.woa.com)
+author: bowxiong

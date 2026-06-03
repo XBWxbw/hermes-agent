@@ -1503,6 +1503,21 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    if provider == "gongfeng":
+        # Direct Gongfeng Copilot Gateway — routes to GongfengClient in agent_runtime_helpers.
+        # Auth is handled internally by GongfengClient (reads GF_TOKEN/GF_DEVICE_ID/GF_USERNAME from env).
+        import os as _os
+        _base = _os.getenv("HERMES_GONGFENG_BASE_URL", "").strip().rstrip("/") or \
+                "https://copilot.code.woa.com/server/openclaw/copilot-gateway/v1"
+        return {
+            "provider": "gongfeng",
+            "api_mode": "chat_completions",
+            "base_url": _base,
+            "api_key": "gongfeng",
+            "source": "config",
+            "requested_provider": requested_provider,
+        }
+
     # Anthropic (native Messages API)
     if provider == "anthropic":
         # Allow base URL override from config.yaml model.base_url, but only

@@ -359,10 +359,12 @@ def init_agent(
         and agent.provider != "codebuddy-acp"
         and agent.provider != "codebuddy-http"
         and agent.provider != "copilot-tencent"
+        and agent.provider != "gongfeng"
         and not str(agent.base_url or "").lower().startswith("acp://copilot")
         and not str(agent.base_url or "").lower().startswith("acp://codebuddy")
         and not str(agent.base_url or "").lower().startswith("http://codebuddy-http")
         and not str(agent.base_url or "").lower().startswith("https://copilot.tencent.com")
+        and not str(agent.base_url or "").lower().startswith("https://copilot.code.woa.com")
         and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
         and (
