@@ -5947,6 +5947,15 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
+    # ── copilot-tencent: direct API, no subprocess needed ──────────────
+    if provider_id == "copilot-tencent":
+        return {
+            "provider": provider_id,
+            "api_key": "copilot-tencent",
+            "base_url": base_url.rstrip("/"),
+            "source": "direct",
+        }
+
     # ── codebuddy-acp: use dedicated env vars ──────────────────────────
     if provider_id == "codebuddy-acp":
         command = (

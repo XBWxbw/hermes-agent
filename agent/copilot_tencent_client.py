@@ -185,8 +185,10 @@ class CopilotTencentClient:
         **_: Any,
     ):
         self.api_key = api_key or "copilot-tencent"
+        self.base_url = _COPILOT_BASE_URL
         self._base_url = _COPILOT_BASE_URL
         self._default_headers = dict(default_headers or {})
+        self._custom_headers: dict[str, str] = {}  # agent_init.py reads this for default_headers
         self.chat = _CopilotChatNamespace(self)
         self.is_closed = False
         # Cache credentials (reload if needed)

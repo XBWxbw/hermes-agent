@@ -3720,6 +3720,15 @@ def resolve_provider_client(
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
+        if provider == "copilot-tencent":
+            # Direct Copilot Tencent API — auth handled internally by CopilotTencentClient
+            if not final_model:
+                final_model = "claude-sonnet-4.6"
+            from agent.copilot_tencent_client import CopilotTencentClient
+            client = CopilotTencentClient(api_key="copilot-tencent")
+            logger.debug("resolve_provider_client: copilot-tencent (%s)", final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
         logger.warning("resolve_provider_client: external-process provider %s not "
                        "directly supported", provider)
         return None, None

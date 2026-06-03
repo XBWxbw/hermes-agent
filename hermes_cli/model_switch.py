@@ -829,11 +829,27 @@ def switch_model(
             "localhost" in _base or "127.0.0.1" in _base
         )
 
+        # Check if the current provider explicitly declares this model —
+        # if so, skip detect_provider_for_model to avoid hijacking to openrouter.
+        _model_in_user_provider = False
+        if user_providers and isinstance(user_providers, dict):
+            _up_cfg = user_providers.get(current_provider, {})
+            if isinstance(_up_cfg, dict):
+                _up_models = _up_cfg.get("models", [])
+                if isinstance(_up_models, dict):
+                    _model_in_user_provider = new_model in _up_models
+                elif isinstance(_up_models, list):
+                    _model_in_user_provider = new_model in _up_models or any(
+                        (m.get("name") == new_model if isinstance(m, dict) else m == new_model)
+                        for m in _up_models
+                    )
+
         if (
             target_provider == current_provider
             and not is_custom
             and not resolved_alias
             and not resolved_in_current_catalog
+            and not _model_in_user_provider
         ):
             detected = detect_provider_for_model(new_model, current_provider)
             if detected:
