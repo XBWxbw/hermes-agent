@@ -54,6 +54,8 @@ _GATEWAY_MODEL_NAMES: dict[str, str] = {
     # 国内模型
     "glm-5.1-ioa": "GLM 5.1",
     "deepseek-v4-flash-ioa": "DeepSeek V4 Flash",
+    "deepseek-v4-pro-ioa": "DeepSeek V4 Pro",
+    "deepseek-v4-pro": "DeepSeek V4 Pro",
     "hy3-preview-ioa": "Hy3 Preview",
     "hy-3-dev": "Hy3 Preview",
     "deepseek-v3-2-volc-ioa": "DeepSeek V3",
