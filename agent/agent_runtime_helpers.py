@@ -25,24 +25,17 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import os
 import re
-import threading
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout
-from agent.message_sanitization import (
-    _repair_tool_call_arguments,
-    _sanitize_surrogates,
-)
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
-from agent.error_classifier import classify_api_error, FailoverReason
+from agent.error_classifier import FailoverReason
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -53,6 +46,20 @@ def _ra():
     import run_agent
     return run_agent
 
+
+AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
+    {"todo", "session_search", "memory", "clarify", "delegate_task"}
+)
+
+
+def agent_runtime_owns_post_tool_hook(agent: Any, function_name: str) -> bool:
+    """Return True when an agent-level tool path emits its own post hook."""
+    if function_name in AGENT_RUNTIME_POST_HOOK_TOOL_NAMES:
+        return True
+    if getattr(agent, "_context_engine_tool_names", None) and function_name in agent._context_engine_tool_names:
+        return True
+    memory_manager = getattr(agent, "_memory_manager", None)
+    return bool(memory_manager and memory_manager.has_tool(function_name))
 
 
 def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_query: str, completed: bool) -> List[Dict[str, Any]]:
@@ -558,6 +565,24 @@ def recover_with_credential_pool(
     """
     pool = agent._credential_pool
     if pool is None:
+        return False, has_retried_429
+
+    # Defensive guard: if a fallback provider is active and its provider name
+    # doesn't match the pool's provider, the pool belongs to the PRIMARY
+    # provider.  Mutating it based on fallback errors would corrupt the
+    # primary's credential state (see #33088) and, via _swap_credential,
+    # overwrite the agent's base_url back to the primary's endpoint — every
+    # subsequent request then goes to the wrong host and 404s (see #33163).
+    # The pool should only act when the agent is still on the same provider
+    # that seeded the pool.
+    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    pool_provider = (getattr(pool, "provider", "") or "").strip().lower()
+    if current_provider and pool_provider and current_provider != pool_provider:
+        _ra().logger.warning(
+            "Credential pool provider mismatch: pool=%s, agent=%s — "
+            "skipping pool mutation to avoid cross-provider contamination",
+            pool_provider, current_provider,
+        )
         return False, has_retried_429
 
     effective_reason = classified_reason
@@ -1405,81 +1430,129 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     old_model = agent.model
     old_provider = agent.provider
 
-    # Clear the per-config context_length override so the new model's
-    # actual context window is resolved via get_model_context_length()
-    # instead of inheriting the stale value from the previous model.
-    agent._config_context_length = None
-
-    # ── Swap core runtime fields ──
-    agent.model = new_model
-    agent.provider = new_provider
-    # Use new base_url when provided; only fall back to current when the
-    # new provider genuinely has no endpoint (e.g. native SDK providers).
-    # Without this guard the old provider's URL (e.g. Ollama's localhost
-    # address) would persist silently after switching to a cloud provider
-    # that returns an empty base_url string.
-    if base_url:
-        agent.base_url = base_url
-    agent.api_mode = api_mode
-    # Invalidate transport cache — new api_mode may need a different transport
-    if hasattr(agent, "_transport_cache"):
-        agent._transport_cache.clear()
-    if api_key:
-        agent.api_key = api_key
-
-    # ── Build new client ──
-    if api_mode == "anthropic_messages":
-        from agent.anthropic_adapter import (
-            build_anthropic_client,
-            resolve_anthropic_token,
-            _is_oauth_token,
+    # ── Snapshot all fields the swap+rebuild can mutate ──
+    # If the rebuild raises (bad API key, network error, build_anthropic_client
+    # failure, etc.) we restore these atomically so the agent isn't left with a
+    # new model/provider name paired with the OLD client — that mismatch causes
+    # HTTP 400s like "claude-sonnet-4-6 is not supported on openai-codex" on the
+    # next turn.  Callers in cli.py / gateway/run.py / tui_gateway/server.py
+    # catch the re-raised exception and show the user a warning; without this
+    # rollback the warning is misleading because the swap partially succeeded.
+    # Use a sentinel so we can distinguish "attribute was unset" from
+    # "attribute was None" and skip the restore for genuinely-missing
+    # attributes (tests construct bare agents via __new__ without all fields).
+    _MISSING = object()
+    _snapshot = {
+        name: getattr(agent, name, _MISSING)
+        for name in (
+            "model",
+            "provider",
+            "base_url",
+            "api_mode",
+            "api_key",
+            "client",
+            "_anthropic_client",
+            "_anthropic_api_key",
+            "_anthropic_base_url",
+            "_is_anthropic_oauth",
+            "_config_context_length",
         )
-        # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
-        # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
-        # API key — falling back would send Anthropic credentials to third-party endpoints.
-        _is_native_anthropic = new_provider == "anthropic"
-        effective_key = (api_key or agent.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or agent.api_key or "")
+    }
+    # _client_kwargs is a dict — snapshot a shallow copy so mutating the
+    # live dict doesn't poison the rollback target.
+    _snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
 
-        # MiniMax OAuth: swap static string for a per-request callable token
-        # provider so the rebuilt client survives 15-min token expiry. See
-        # the matching block in agent_init.py for the full rationale.
-        if new_provider == "minimax-oauth" and isinstance(effective_key, str) and effective_key:
+    try:
+        # Clear the per-config context_length override so the new model's
+        # actual context window is resolved via get_model_context_length()
+        # instead of inheriting the stale value from the previous model.
+        agent._config_context_length = None
+
+        # ── Swap core runtime fields ──
+        agent.model = new_model
+        agent.provider = new_provider
+        # Use new base_url when provided; only fall back to current when the
+        # new provider genuinely has no endpoint (e.g. native SDK providers).
+        # Without this guard the old provider's URL (e.g. Ollama's localhost
+        # address) would persist silently after switching to a cloud provider
+        # that returns an empty base_url string.
+        if base_url:
+            agent.base_url = base_url
+        agent.api_mode = api_mode
+        # Invalidate transport cache — new api_mode may need a different transport
+        if hasattr(agent, "_transport_cache"):
+            agent._transport_cache.clear()
+        if api_key:
+            agent.api_key = api_key
+
+        # ── Build new client ──
+        if api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                resolve_anthropic_token,
+                _is_oauth_token,
+            )
+            # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
+            # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
+            # API key — falling back would send Anthropic credentials to third-party endpoints.
+            _is_native_anthropic = new_provider == "anthropic"
+            effective_key = (api_key or agent.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or agent.api_key or "")
+
+            # MiniMax OAuth: swap static string for a per-request callable token
+            # provider so the rebuilt client survives 15-min token expiry. See
+            # the matching block in agent_init.py for the full rationale.
+            if new_provider == "minimax-oauth" and isinstance(effective_key, str) and effective_key:
+                try:
+                    from hermes_cli.auth import build_minimax_oauth_token_provider
+                    effective_key = build_minimax_oauth_token_provider()
+                except Exception as _mm_exc:  # noqa: BLE001
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        "MiniMax OAuth: failed to install per-request token provider "
+                        "on switch (%s); using static bearer.",
+                        _mm_exc,
+                    )
+
+            agent.api_key = effective_key
+            agent._anthropic_api_key = effective_key
+            agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
+            agent._anthropic_client = build_anthropic_client(
+                effective_key, agent._anthropic_base_url,
+                timeout=get_provider_request_timeout(agent.provider, agent.model),
+            )
+            agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
+            agent.client = None
+            agent._client_kwargs = {}
+        else:
+            effective_key = api_key or agent.api_key
+            effective_base = base_url or agent.base_url
+            agent._client_kwargs = {
+                "api_key": effective_key,
+                "base_url": effective_base,
+            }
+            _sm_timeout = get_provider_request_timeout(agent.provider, agent.model)
+            if _sm_timeout is not None:
+                agent._client_kwargs["timeout"] = _sm_timeout
+            agent.client = agent._create_openai_client(
+                dict(agent._client_kwargs),
+                reason="switch_model",
+                shared=True,
+            )
+    except Exception:
+        # Rollback every mutated field to the pre-swap snapshot so the agent
+        # is left consistent (old model + old provider + old client) and the
+        # caller's exception handler can surface a meaningful warning.  The
+        # exception is re-raised; cli.py / gateway/run.py / tui_gateway catch
+        # it and print "Agent swap failed; change applied to next session".
+        for _name, _value in _snapshot.items():
+            if _value is _MISSING:
+                # Attribute did not exist before the swap — don't fabricate it.
+                continue
             try:
-                from hermes_cli.auth import build_minimax_oauth_token_provider
-                effective_key = build_minimax_oauth_token_provider()
-            except Exception as _mm_exc:  # noqa: BLE001
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "MiniMax OAuth: failed to install per-request token provider "
-                    "on switch (%s); using static bearer.",
-                    _mm_exc,
-                )
-
-        agent.api_key = effective_key
-        agent._anthropic_api_key = effective_key
-        agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
-        agent._anthropic_client = build_anthropic_client(
-            effective_key, agent._anthropic_base_url,
-            timeout=get_provider_request_timeout(agent.provider, agent.model),
-        )
-        agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
-        agent.client = None
-        agent._client_kwargs = {}
-    else:
-        effective_key = api_key or agent.api_key
-        effective_base = base_url or agent.base_url
-        agent._client_kwargs = {
-            "api_key": effective_key,
-            "base_url": effective_base,
-        }
-        _sm_timeout = get_provider_request_timeout(agent.provider, agent.model)
-        if _sm_timeout is not None:
-            agent._client_kwargs["timeout"] = _sm_timeout
-        agent.client = agent._create_openai_client(
-            dict(agent._client_kwargs),
-            reason="switch_model",
-            shared=True,
-        )
+                setattr(agent, _name, _value)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
 
     # ── Re-evaluate prompt caching ──
     agent._use_prompt_caching, agent._use_native_cache_layout = (
@@ -1603,36 +1676,84 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
+                function_name,
+                function_args,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
             )
         except Exception:
             pass
     if block_message is not None:
-        return json.dumps({"error": block_message}, ensure_ascii=False)
+        result = json.dumps({"error": block_message}, ensure_ascii=False)
+        try:
+            from model_tools import _emit_post_tool_call_hook
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                status="blocked",
+                error_type="plugin_block",
+                error_message=block_message,
+            )
+        except Exception:
+            pass
+        return result
+
+    tool_start_time = time.monotonic()
+
+    def _finish_agent_tool(result: Any) -> Any:
+        try:
+            from model_tools import _emit_post_tool_call_hook
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                duration_ms=int((time.monotonic() - tool_start_time) * 1000),
+            )
+        except Exception:
+            pass
+        return result
 
     if function_name == "todo":
         from tools.todo_tool import todo_tool as _todo_tool
-        return _todo_tool(
-            todos=function_args.get("todos"),
-            merge=function_args.get("merge", False),
-            store=agent._todo_store,
+        return _finish_agent_tool(
+            _todo_tool(
+                todos=function_args.get("todos"),
+                merge=function_args.get("merge", False),
+                store=agent._todo_store,
+            )
         )
     elif function_name == "session_search":
         session_db = agent._get_session_db_for_recall()
         if not session_db:
             from hermes_state import format_session_db_unavailable
-            return json.dumps({"success": False, "error": format_session_db_unavailable()})
+            return _finish_agent_tool(json.dumps({"success": False, "error": format_session_db_unavailable()}))
         from tools.session_search_tool import session_search as _session_search
-        return _session_search(
-            query=function_args.get("query", ""),
-            role_filter=function_args.get("role_filter"),
-            limit=function_args.get("limit", 3),
-            session_id=function_args.get("session_id"),
-            around_message_id=function_args.get("around_message_id"),
-            window=function_args.get("window", 5),
-            sort=function_args.get("sort"),
-            db=session_db,
-            current_session_id=agent.session_id,
+        return _finish_agent_tool(
+            _session_search(
+                query=function_args.get("query", ""),
+                role_filter=function_args.get("role_filter"),
+                limit=function_args.get("limit", 3),
+                session_id=function_args.get("session_id"),
+                around_message_id=function_args.get("around_message_id"),
+                window=function_args.get("window", 5),
+                sort=function_args.get("sort"),
+                db=session_db,
+                current_session_id=agent.session_id,
+            )
         )
     elif function_name == "memory":
         target = function_args.get("target", "memory")
@@ -1658,25 +1779,31 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 )
             except Exception:
                 pass
-        return result
+        return _finish_agent_tool(result)
     elif agent._memory_manager and agent._memory_manager.has_tool(function_name):
-        return agent._memory_manager.handle_tool_call(function_name, function_args)
+        return _finish_agent_tool(agent._memory_manager.handle_tool_call(function_name, function_args))
     elif function_name == "clarify":
         from tools.clarify_tool import clarify_tool as _clarify_tool
-        return _clarify_tool(
-            question=function_args.get("question", ""),
-            choices=function_args.get("choices"),
-            callback=agent.clarify_callback,
+        return _finish_agent_tool(
+            _clarify_tool(
+                question=function_args.get("question", ""),
+                choices=function_args.get("choices"),
+                callback=agent.clarify_callback,
+            )
         )
     elif function_name == "delegate_task":
-        return agent._dispatch_delegate_task(function_args)
+        return _finish_agent_tool(agent._dispatch_delegate_task(function_args))
     else:
         return _ra().handle_function_call(
             function_name, function_args, effective_task_id,
             tool_call_id=tool_call_id,
             session_id=agent.session_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
             enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
             skip_pre_tool_call_hook=True,
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
         )
 
 
@@ -1971,6 +2098,36 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
     # context compaction).  Don't pass null to the API.
     api_msg.pop("reasoning_content", None)
 
+
+def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
+    """Re-pad assistant turns with reasoning_content for the active provider.
+
+    ``api_messages`` is built once, before the retry loop, while the *primary*
+    provider is active.  If a mid-conversation fallback then switches to a
+    require-side provider (DeepSeek / Kimi / MiMo thinking mode), assistant
+    turns that were built when the prior provider did NOT need the echo-back go
+    out without ``reasoning_content`` and the new provider rejects them with
+    HTTP 400 ("The reasoning_content in the thinking mode must be passed back").
+
+    Calling this immediately before building the request kwargs re-applies the
+    pad against the *current* provider.  It is idempotent and a no-op unless
+    ``_needs_thinking_reasoning_pad()`` is True for the active provider, so it
+    is safe to call every iteration and covers every fallback path.
+
+    Returns the number of assistant turns that gained reasoning_content.
+    """
+    if not agent._needs_thinking_reasoning_pad():
+        return 0
+    padded = 0
+    for api_msg in api_messages:
+        if api_msg.get("role") != "assistant":
+            continue
+        if api_msg.get("reasoning_content"):
+            continue
+        copy_reasoning_content_for_api(agent, api_msg, api_msg)
+        if api_msg.get("reasoning_content"):
+            padded += 1
+    return padded
 
 
 def _iter_pool_sockets(client: Any):
